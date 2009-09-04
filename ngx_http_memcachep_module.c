@@ -4,6 +4,15 @@
 #include <ngx_http.h>
 
 typedef struct {
+    ngx_connection_t       *connection;
+
+    ngx_str_t               out;
+    ngx_str_t               out_buffer;
+    ngx_buf_t              *buffer;
+
+} ngx_http_memcachedp_session_t;
+
+typedef struct {
     ngx_msec_t              timeout;
     ngx_msec_t              resolver_timeout;
 
@@ -360,13 +369,17 @@ ngx_http_memcachep_close_connection(ngx_connection_t *c)
     ngx_destroy_pool(pool);
 }
 
-void ngx_http_memcachep_process(ngx_connection_t *c, ngx_str_t uri);
+void ngx_http_memcachep_process(ngx_event_t *wev, ngx_str_t uri);
 
-// 書き込みできるようになったらイベントループから呼ばれる
 static void
-ngx_http_memcachep_send_write_handler(ngx_event_t *wev)
+ngx_http_memcachep_send(ngx_event_t *wev)
 {
-    ngx_connection_t *c = wev->data;
+    ssize_t                        n;
+    ngx_http_memcachedp_session_t *s;
+    ngx_connection_t              *c;
+
+    c = wev->data;
+    s = c->data;
 
     if (wev->timedout) {
         c->timedout = 1;
@@ -374,38 +387,17 @@ ngx_http_memcachep_send_write_handler(ngx_event_t *wev)
         return;
     }
 
-    if (ngx_handle_write_event(wev, 0) != NGX_OK) {
-        ngx_http_memcachep_close_connection(c);
-        return;
-    }
-}
-
-static void
-ngx_http_memcachep_send(ngx_connection_t *c, ngx_str_t out)
-{
-    ssize_t                    n;
-    ngx_event_t               *wev;
-
-    wev = c->write;
-    wev->handler = ngx_http_memcachep_send_write_handler;
-
-    if (wev->timedout) {
-        c->timedout = 1;
-        ngx_http_memcachep_close_connection(c);
-        return;
-    }
-
-    if (out.len == 0) {
+    if (s->out.len == 0) {
        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
             ngx_http_memcachep_close_connection(c);
         }
         return;
     }
 
-    n = c->send(c, out.data, out.len);
+    n = c->send(c, s->out.data, s->out.len);
 
     if (n > 0) {
-        out.len -= n;
+        s->out.len -= n;
 
 	if (wev->timer_set) {
 	    ngx_del_timer(wev);
@@ -427,24 +419,37 @@ ngx_http_memcachep_send(ngx_connection_t *c, ngx_str_t out)
 }
 
 static void
-ngx_http_memcachep_send_error(ngx_connection_t *c)
+ngx_http_memcachep_send_error(ngx_event_t *wev)
 {
-    ngx_str_t                  msg = ngx_string("ERROR\r\n");
-    ngx_http_memcachep_send(c, msg);
+    ngx_str_t                      msg = ngx_string("ERROR\r\n");
+    ngx_http_memcachedp_session_t *s;
+    ngx_connection_t              *c;
+
+    c      = wev->data;
+    s      = c->data;
+    s->out = msg;
+    ngx_http_memcachep_send(wev);
 }
 
 
 ngx_int_t
-ngx_http_memcachep_parse_command(ngx_connection_t *c, ngx_buf_t *buffer)
+ngx_http_memcachep_parse_command(ngx_event_t *wev)
 {   
     ssize_t                    len, line_len;
     u_char                     ch, *p, *sc, *keystartp, *keyendp;
     ngx_str_t                  uri;
+    ngx_buf_t                 *buffer;
+    ngx_connection_t          *c;
+    ngx_http_memcachedp_session_t *s;
     enum {
         sw_start = 0,
         sw_searchkey,
         sw_fetchkey
     } state;
+
+    c = wev->data;
+    s = c->data;
+    buffer = s->buffer;
 
     state = sw_start;
 
@@ -500,7 +505,7 @@ found:
     uri.len  = keyendp - keystartp;
     uri.data[uri.len] = '\0';
 
-    ngx_http_memcachep_process(c, uri);
+    ngx_http_memcachep_process(wev, uri);
 
     return NGX_AGAIN;
 invalid:
@@ -515,9 +520,11 @@ ngx_http_memcachep_read_line(ngx_event_t *wev)
     ssize_t                    n;
     ngx_buf_t *buffer;
     ngx_connection_t *c;
+    ngx_http_memcachedp_session_t *s;
 
     c = wev->data;
-    buffer = c->data;
+    s = c->data;
+    buffer = s->buffer;
 
     n = c->recv(c, buffer->last, buffer->end - buffer->last);
 
@@ -539,12 +546,12 @@ ngx_http_memcachep_read_line(ngx_event_t *wev)
         return;
     }
 
-    rc = ngx_http_memcachep_parse_command(c, buffer);
+    rc = ngx_http_memcachep_parse_command(wev);
 
     // パースに失敗したので ERROR を返す
     if (rc == NGX_ERROR) {
         buffer->last = buffer->pos;
-        ngx_http_memcachep_send_error(c);
+        ngx_http_memcachep_send_error(wev);
         return;
     }
 
@@ -558,10 +565,16 @@ ngx_http_memcachep_read_line(ngx_event_t *wev)
 void
 ngx_http_memcachep_init_connection(ngx_connection_t *c)
 {
+    ngx_http_memcachedp_session_t *s;
 
-    c->data = ngx_create_temp_buf(c->pool, 1024);
+    s = ngx_pcalloc(c->pool, sizeof(ngx_http_memcachedp_session_t));
+    s->connection = c;
+    s->buffer = ngx_create_temp_buf(c->pool, 1024);
+    s->out_buffer.data = ngx_pcalloc(c->pool, 4096);
 
-    c->read->handler = ngx_http_memcachep_read_line;
+    c->data = s;
+    c->write->handler = ngx_http_memcachep_send;
+    c->read->handler  = ngx_http_memcachep_read_line;
 
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
         ngx_http_memcachep_close_connection(c);
@@ -570,9 +583,15 @@ ngx_http_memcachep_init_connection(ngx_connection_t *c)
 }
 
 void
-ngx_http_memcachep_process(ngx_connection_t *c, ngx_str_t uri)
+ngx_http_memcachep_process(ngx_event_t *wev, ngx_str_t uri)
 {
-    ngx_http_conf_ctx_t *ctx = (ngx_http_conf_ctx_t *) c->listening->servers;
+    ngx_connection_t          *c;
+    ngx_http_memcachedp_session_t *s;
+    ngx_http_conf_ctx_t *ctx;
+
+    c = wev->data;
+    s = c->data;
+    ctx = (ngx_http_conf_ctx_t *) c->listening->servers;
 
     if (1) {
         ngx_http_request_t *r;
@@ -628,27 +647,25 @@ ngx_http_memcachep_process(ngx_connection_t *c, ngx_str_t uri)
 
         // データが帰って来たのでレスポンス返す
         if (r->postponed && r->postponed->out && r->postponed->out->buf) {
-            ngx_str_t    line;
-            ngx_str_t    crlf = ngx_string("\r\n");
-            ngx_str_t    end  = ngx_string("END\r\n");
             ngx_chain_t *cl;
+	    ngx_str_t    crlf = ngx_string("\r\n");
+	    ngx_str_t    end  = ngx_string("END\r\n");
 
-            line.len = (10 + uri.len) * 3;
-            line.data = ngx_pnalloc(c->pool, line.len);
-            if (line.data == NULL) {
+            s->out.len = (10 + uri.len) * 3;
+            s->out.data = ngx_pnalloc(c->pool, s->out.len);
+            if (s->out.data == NULL) {
                 ngx_http_memcachep_close_connection(c);
                 return;
             }
-            line.len = ngx_sprintf(line.data, "VALUE %s 0 %d" CRLF, (char *)uri.data, (int)r->headers_out.content_length_n) - line.data;
+            s->out.len = ngx_sprintf(s->out.data, "VALUE %s 0 %d" CRLF, (char *)uri.data, (int)r->headers_out.content_length_n) - s->out.data;
 
-	    ngx_http_memcachep_send(c, line);
+	    ngx_http_memcachep_send(wev);
 
             for (cl = r->postponed->out; cl; cl = cl->next) {
                 ssize_t      n, size;
-                ngx_str_t buf, buf2;
-                buf.data = cl->buf->pos;
-                buf.len  = cl->buf->last - cl->buf->pos;
-    	   	ngx_http_memcachep_send(c, buf);
+                s->out.data = cl->buf->pos;
+                s->out.len  = cl->buf->last - cl->buf->pos;
+		ngx_http_memcachep_send(wev);
 
                 if (!cl->buf->file || !cl->buf->file->fd) {
                     continue;
@@ -664,20 +681,22 @@ ngx_http_memcachep_process(ngx_connection_t *c, ngx_str_t uri)
                     if (size > 4096) {
                         size = 4096;
                     }
-                    buf2.data = ngx_pcalloc(c->pool, sizeof(u_char *) * (size + 1));
-                    n = ngx_read_file(cl->buf->file, buf2.data, (size_t) size, cl->buf->file_last);
+                    n = ngx_read_file(cl->buf->file, s->out_buffer.data, (size_t) size, cl->buf->file_last);
                     if (n != size) {
                         ngx_http_memcachep_close_connection(c);
                         return;
                     }
-		    buf2.len = n;
-  	   	    ngx_http_memcachep_send(c, buf2);
+		    s->out.data = s->out_buffer.data;
+		    s->out.len  = n;
+		    ngx_http_memcachep_send(wev);
                     cl->buf->file_last += n;
                 }
             }
 
-	    ngx_http_memcachep_send(c, crlf);
-	    ngx_http_memcachep_send(c, end);
+	    s->out = crlf;
+	    ngx_http_memcachep_send(wev);
+	    s->out = end;
+	    ngx_http_memcachep_send(wev);
         }
     }
 }
