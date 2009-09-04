@@ -1,0 +1,3 @@
+$ cd your_ngninx_src_dir
+$ ./configure --add-module=/foo/var/ngninx-ngx_http_memcachep_module
+$ make && make install
