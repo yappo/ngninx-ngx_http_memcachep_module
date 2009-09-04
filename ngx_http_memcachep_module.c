@@ -595,6 +595,7 @@ ngx_http_memcachep_process(ngx_connection_t *c, ngx_str_t uri)
         if (r->postponed && r->postponed->out && r->postponed->out->buf) {
             ngx_str_t    line;
             ngx_str_t    crlf = ngx_string("\r\n");
+            ngx_str_t    end  = ngx_string("END\r\n");
             ngx_chain_t *cl;
 
             line.len = (10 + uri.len) * 3;
@@ -641,7 +642,7 @@ ngx_http_memcachep_process(ngx_connection_t *c, ngx_str_t uri)
             }
 
 	    ngx_http_memcachep_send(c, crlf);
-	    ngx_http_memcachep_send(c, crlf);
+	    ngx_http_memcachep_send(c, end);
         }
     }
 }
