@@ -362,10 +362,39 @@ ngx_http_memcachep_close_connection(ngx_connection_t *c)
 
 void ngx_http_memcachep_process(ngx_connection_t *c, ngx_str_t uri);
 
+// 書き込みできるようになったらイベントループから呼ばれる
+static void
+ngx_http_memcachep_send_write_handler(ngx_event_t *wev)
+{
+    ngx_connection_t *c = wev->data;
+
+    if (wev->timedout) {
+        c->timedout = 1;
+        ngx_http_memcachep_close_connection(c);
+        return;
+    }
+
+    if (ngx_handle_write_event(wev, 0) != NGX_OK) {
+        ngx_http_memcachep_close_connection(c);
+        return;
+    }
+}
+
 static void
 ngx_http_memcachep_send(ngx_connection_t *c, ngx_str_t out)
 {
     ssize_t                    n;
+    ngx_event_t               *wev;
+
+    wev = c->write;
+    wev->handler = ngx_http_memcachep_send_write_handler;
+
+    if (wev->timedout) {
+        c->timedout = 1;
+        ngx_http_memcachep_close_connection(c);
+        return;
+    }
+
     if (out.len == 0) {
        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
             ngx_http_memcachep_close_connection(c);
@@ -377,6 +406,11 @@ ngx_http_memcachep_send(ngx_connection_t *c, ngx_str_t out)
 
     if (n > 0) {
         out.len -= n;
+
+	if (wev->timer_set) {
+	    ngx_del_timer(wev);
+	}
+
         return;
     }
 
@@ -385,6 +419,7 @@ ngx_http_memcachep_send(ngx_connection_t *c, ngx_str_t out)
         return;
     }
 
+    ngx_add_timer(c->write, 30000);
     if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
         ngx_http_memcachep_close_connection(c);
         return;
