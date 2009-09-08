@@ -377,6 +377,8 @@ ngx_http_memcachep_send(ngx_event_t *wev)
     ssize_t                        n;
     ngx_http_memcachedp_session_t *s;
     ngx_connection_t              *c;
+    size_t                         outlen;
+    u_char                        *outstr;
 
     c = wev->data;
     s = c->data;
@@ -394,10 +396,43 @@ ngx_http_memcachep_send(ngx_event_t *wev)
         return;
     }
 
+#if 1
+    // バッファ吐けるまでループしてsendするんだけど、このコードってasyncしてなくね？
+    outstr = s->out.data;
+    outlen = s->out.len;
+    for ( ;; ) {
+        n = c->send(c, outstr, outlen);
+
+        if (n == NGX_ERROR) {
+            ngx_http_memcachep_close_connection(c);
+            return;
+        }
+
+        if (n > 0) {
+            outstr += n;
+            outlen -= n;
+        }
+        if (outlen) {
+            continue;
+        }
+        break;
+    }
+#else
     n = c->send(c, s->out.data, s->out.len);
 
     if (n > 0) {
         s->out.len -= n;
+
+	// 送りきれなかったので、もう一度バッファに突っ込む
+	if (s->out.len > 0) {
+	    s->out.data	 = s->out.data + n;
+
+    if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+        ngx_http_memcachep_close_connection(c);
+        return;
+    }
+	    ngx_http_memcachep_send(wev);
+        }
 
 	if (wev->timer_set) {
 	    ngx_del_timer(wev);
@@ -411,11 +446,14 @@ ngx_http_memcachep_send(ngx_event_t *wev)
         return;
     }
 
-    ngx_add_timer(c->write, 30000);
+//    ngx_add_timer(c->write, 30000);
+    ngx_add_timer(c->write, 300);
     if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
         ngx_http_memcachep_close_connection(c);
         return;
     }
+#endif
+
 }
 
 static void
